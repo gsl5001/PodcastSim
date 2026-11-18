@@ -1,0 +1,17 @@
+# Per-host synthesis settings for the verbatim-trained Chatterbox voices.
+# Chosen by ear from the 2026-09-06 parameter sweep (parameter sweep).
+#
+# Chosen by ear: cfg_weight high (>=0.5), exaggeration low (~0.3); temperature
+# and repetition_penalty made no audible difference, so left at library defaults.
+# Checkpoints: s4/finetune_verbatim/<host>/t3_cfg.safetensors
+#
+# defaults apply to every host unless overridden in `hosts:` below.
+defaults:
+  exaggeration: 0.3
+  cfg_weight: 0.5
+  temperature: 0.8          # library default; no audible effect in the sweep
+  repetition_penalty: 1.2   # library default; no audible effect in the sweep
+
+hosts:
+  host_0: {}
+  host_1: {}

@@ -1,0 +1,15 @@
+# Episodes excluded from processing.
+#
+# Sources are never deleted (plan rule 2); they are just skipped. Each entry
+# says which episode and why. Match by source filename (e.g. "trailer.mp3") or by
+# episode-id digest prefix.
+#
+# Policy (2026-09-02): drop troublesome episodes rather than risk mixing up
+# speakers or degrading training data. Completeness is not a goal. Guest and live
+# episodes are already filtered at download time (downloads/fetch_trih.py); this
+# catches anything that is not a normal two-host studio episode.
+
+exclude:
+  - match: "trailer.mp3"
+    reason: "Show trailer/promo, not a real episode."
+    category: other

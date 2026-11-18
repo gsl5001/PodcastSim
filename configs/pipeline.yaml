@@ -1,0 +1,320 @@
+# PodcastSim pipeline configuration.
+#
+# Plan S3 config contract: every threshold in PODCASTSIM_PLAN.md lives here, so
+# calibration (S12.3) is a config change, not a code change. Section references
+# in comments point at the plan. Plan preamble: "Treat all numeric thresholds as
+# starting points to be calibrated on our own data, not as truths."
+#
+# Each top-level stage key is hashed independently into that stage's
+# params_hash -- editing s4_voices does NOT invalidate completed s1_diarize work.
+
+paths:
+  # All Drive-backed at run time (plan S2.2: "State lives on Google Drive").
+  raw: data/raw
+  work: data/work
+  # Scratch, NOT Drive-backed: safe to wipe, recreated on demand. On Colab this
+  # is VM-local (65 GiB free at /content). The 16 kHz analysis copy lives here
+  # because it is a pure function of the source MP3 (~20 s to regenerate,
+  # ~110 MB to store); caching 71 of them would consume ~7.8 GB of Drive.
+  cache: data/cache
+  hosts: data/hosts
+  gold: data/gold
+  models: models
+  out: out
+  fixtures: fixtures
+
+runtime:
+  # S2.2: batch sizes chosen so a session death loses <= 2 hours.
+  max_batch_hours: 2.0
+  heartbeat_s: 60          # S2.2 watchdog
+  episode_timeout_factor: 1.5   # S2.2: timeout at 1.5x expected
+  oom_retry_halve_batch: true   # S2.2: catch CUDA OOM, retry at half batch
+  seed: 1234               # S14.18: seeds do not make GPU kernels deterministic
+
+# --------------------------------------------------------------------------
+s0_ingest:                 # Plan S5
+  analysis_sample_rate: 16000    # S14.2: ALL analysis models are 16 kHz
+  analysis_channels: 1
+  # wav, not flac: both are lossless and bit-identical (verified by decoded-PCM
+  # md5), but WAV needs no decode at read time. pyannote runs took >15 min on a
+  # 50-minute FLAC where the measured curve predicted ~5; VM scratch is 65 GiB,
+  # so trading 2x size for zero decode cost is the right way round.
+  analysis_codec: wav
+  # Keep the decoded analysis copy after the stage finishes. False on a
+  # disk-constrained machine; True when S1 runs in the same session.
+  keep_analysis_copy: false
+  # S5.1: check real bandwidth; many 128 kbps podcasts are low-passed at ~16 kHz,
+  # which decides whether "24 kHz" training clips are honest.
+  spectral_rolloff_probe_s: 60
+  min_honest_bandwidth_hz: 11000
+  dedupe:
+    pcm_sha256: true             # S5.2
+    transcript_minhash_threshold: 0.8   # applied in S3
+  segmentation:
+    # DEVIATION from S5.3 Plan A (inaSpeechSegmenter): that package still
+    # requires tensorflow[and-cuda] AND onnxruntime-gpu (0.8.0, Sept 2025),
+    # ~3 GB of CUDA extras plus its own venv, for one coarse labelling pass.
+    # AST is already required by S8.6 for per-clip filtering, so reusing it here
+    # adds no dependency, removes a venv, and keeps S0 and S3 on identical
+    # thresholds (S14.5 warns about cross-model threshold mismatch).
+    # `none` emits empty spans and warns; never treat that as "all clean speech".
+    backend: ast
+    model: MIT/ast-finetuned-audioset-10-10-0.4593
+    speech_threshold: 0.35
+    music_threshold: 0.30
+    # Advisory flags for played media (see segmentation.py). Not used to drop
+    # audio -- S2 decides host vs guest from embeddings (S7.4/S7.6) -- but they
+    # mark spans and episodes for scrutiny and feed S3's clip filters.
+    playback_threshold: 0.20
+    nonhost_voice_threshold: 0.20
+    hop_s: 5.0
+    batch: 16
+    min_span_s: 1.0
+    mark_speech_over_music: true
+  date_extraction:
+    order: [id3_TDRC, id3_TYER, filename_regex, file_mtime]  # S5.4
+    filename_regex: '(20\d{2})[-_]?(\d{2})?[-_]?(\d{2})?'
+  gate:                          # Gate S0
+    speech_ratio_min: 0.60
+    speech_ratio_max: 0.98
+    music_detected_fraction_min: 0.80
+    max_wall_s_per_audio_hour: 30
+    decode_failures_allowed: 0
+
+# --------------------------------------------------------------------------
+s1_diarize:                # Plan S6
+  backend: pyannote        # Plan A; Plan B diarizen, Plan C sortformer
+  # S14.12: snapshot the gated repo once, then load by local path. The token is
+  # read from ~/.config/podcastsim/hf_token or $HF_TOKEN -- never from config.
+  model_repo: pyannote/speaker-diarization-community-1
+  min_speakers: 2          # S14.16: NEVER num_speakers=3; guests exist
+  # S6.1 suggests 6. Raised to 8 because this show plays clips (YouTube, films,
+  # sound effects) carrying voices that are neither host nor guest. With a tight
+  # cap, clustering is forced to merge those voices into an existing cluster --
+  # and a clip merged into a host cluster poisons that host's training data
+  # irrecoverably. Over-segmentation is the safe error: S7.4 already merges
+  # "two local speakers both matching H", so a host split across clusters is
+  # repaired downstream. Asymmetric risk, so err high.
+  max_speakers: 8
+  clustering_threshold: 0.6      # S6.1: VBx default; tune on gold set
+  overlap_pad_s: 0.25            # S6.1
+  min_turn_s_for_embedding: 2.0  # S6.1: do not trust embeddings from <2 s
+  long_episode:
+    split_over_hours: 2.0        # S6.1
+    chunk_minutes: 60
+    min_split_silence_s: 2.0
+    relink_cosine: 0.7
+  chunk:
+    # Split episodes longer than this. S6.1 uses 2 h for OOM; we use a much
+    # lower bound because free-tier Colab reclaims the VM within ~15-20 min and
+    # a ~10 min diarization keeps losing that race. 40 min -> ~5 min diarize,
+    # which survives. Set high (e.g. 99999) to disable when on a stable box.
+    over_duration_s: 2400
+    target_s: 2340               # ~39 min: 89.mp3 (78 min) -> 2 chunks
+    max_s: 2700                  # hard cap if no silence is near the target
+    relink_cosine: 0.7           # S6.1: >0.7 cosine -> same speaker across chunks
+  scoring:
+    collar: 0.25                 # S14.4: fix ours and never compare across settings
+    skip_overlap: false
+  gate:                          # Gate S1-A
+    der_pass: 0.10
+    der_escalate: 0.20
+    jer_pass: 0.25
+    jer_escalate: 0.40
+    dominant_speaker_min_share: 0.05
+    dominant_speaker_count: [3, 4]
+    dominant_count_ok_fraction: 0.90
+    # RECALIBRATED for this show. S6.1's 2-10% band assumes an ordinary podcast;
+    # the overlap check's real job is catching music/noise leaking in as a fake
+    # speaker. the owner confirmed (2026-09-02) these hosts talk over each other a
+    # lot, and the measured overlap (0.12-0.30) is genuine simultaneous speech:
+    # it equals speaker_time_sum minus speech_union exactly, so pyannote is not
+    # inventing it. Do NOT tune the diarizer to suppress it -- that would delete
+    # real crosstalk. The escalate ceiling stays as a gross-failure tripwire
+    # (music leaking would push a persistent extra speaker and drive this much
+    # higher). Provisional until the gold set (S6.4) sets it properly.
+    overlap_ratio_min: 0.05
+    overlap_ratio_max: 0.35
+    overlap_ratio_escalate: 0.50
+    max_wall_min_per_audio_hour: 3
+    escalate_wall_min_per_audio_hour: 10
+
+# --------------------------------------------------------------------------
+s2_identify:               # Plan S7
+  # DEVIATION from S7.1's ResNet293-LM: its `wespeaker` package will not
+  # pip-install on the Colab image (S2.6). We use pyannote's own embedding model,
+  # same WeSpeaker family, already present, 256-dim, adequate for 3 distinct
+  # hosts. Thresholds below are for THIS model, not the plan's resnet293 numbers.
+  embedding_model_repo: pyannote/wespeaker-voxceleb-resnet34-LM
+  # S7.3: calibrate at the EER point. 0.45-0.65 for ResNet-LM-family models.
+  # S14.5: cosine thresholds are model-specific; never copy across models.
+  sim_threshold: 0.55
+  margin: 0.10
+  enrollment:
+    minutes_per_host: [2, 5]     # S7.2
+    episodes_per_host: [3, 5]
+    window_s: 3.0
+  assignment:
+    min_turn_s: 3.0              # S7.4
+    max_turn_seconds_total: 60
+  drift:                         # S7.5
+    era: calendar_year           # or 30-episode windows if dates missing
+    ema_alpha: 0.1
+    new_era_threshold_drop: 0.05
+  per_turn_recheck:              # S7.6
+    min_turn_s: 2.0
+    drop_below: sim_threshold_minus_0.10
+  review_flags:                  # S7.4
+    host_share_min: 0.05
+    guest_share_max: 0.40
+  gate:                          # Gate S2-A
+    gold_host_accuracy: 1.00
+    guest_to_host_errors_allowed: 0
+    best_match_ok_fraction: 0.95
+    best_match_escalate_below: 0.40
+    best_match_escalate_fraction: 0.10
+    review_fraction_max: 0.10
+    review_fraction_escalate: 0.25
+    host_share_range: [0.15, 0.60]
+    host_share_escalate_below: 0.05
+    silhouette_min: 0.30
+    silhouette_escalate: 0.10
+
+# --------------------------------------------------------------------------
+s3_dataset:                # Plan S8
+  target_sample_rate: 24000      # S8.2: cut at native rate, then resample
+  clip_duration_s: [1.0, 20.0]
+  vad:
+    backend: silero_v6           # S8.3
+    split_range_s: [3.0, 20.0]
+    edge_padding_ms: 150         # keep 100-200 ms
+  asr:                           # S8.4
+    primary: crisper_whisper           # verbatim (um/uh, false starts)
+    crisper_repo: nyrahealth/CrisperWhisper
+    beam_size: 5
+    condition_on_previous_text: false
+    vad_filter: true
+    second_opinion: parakeet_tdt_0.6b_v3
+    inter_asr_wer_drop_above: 0.15
+    verbatim_optional: crisper_whisper   # keeps um/uh; CC-BY-NC
+  alignment:                     # S8.5
+    model: qwen3_forced_aligner_0.6b
+    min_mean_token_score: 0.5
+    max_word_gap_s: 1.5
+  filters:                       # S8.6 -- all tunable; S8.2 Plan B relaxations noted
+    dnsmos_ovrl_min: 3.0         # Plan B relaxes to 2.7
+    dnsmos_bak_min: 3.5
+    utmos_min: 3.5               # Plan B relaxes to 3.2
+    wada_snr_db_min: 20
+    ast_music_max: 0.2
+    ast_laughter_max: 0.3
+    ast_require_top1_speech: true
+    purity_margin_below_sim: 0.10
+    whisper_avg_logprob_min: -0.7
+    whisper_no_speech_prob_max: 0.5
+    whisper_compression_ratio_max: 2.4
+    # CrisperWhisper path: it exposes no logprob/no_speech metrics, so clips are
+    # gated on audio quality + text sanity instead of the whisper_* cutoffs above.
+    crisper_min_words: 2                 # reject clips transcribing to <2 words
+    crisper_min_snr_db: 12              # reject clips below this SNR-like dynamic range
+    language: en
+    language_prob_min: 0.8
+    max_clipped_sample_fraction: 0.02   # after peak-normalisation; hot masters overshoot
+    minhash_duplicate_jaccard: 0.8
+  loudness:                      # S8.7
+    target_lufs: -23.0
+    true_peak_max_dbtp: -1.0
+  sharding:                      # S14.13: Drive is slow for many small files
+    format: tar
+    clips_per_shard: 2000
+  gate:                          # Gate S3-A
+    retained_hours_per_host_min: 5.0
+    retained_hours_escalate_below: 1.0
+    retention_rate_range: [0.30, 0.60]
+    retention_escalate_below: 0.20
+    retention_escalate_above: 0.85
+    purity_ok_fraction: 0.98
+    purity_escalate_below: 0.95
+    cross_host_leakage_max: 0.005
+    cross_host_leakage_escalate: 0.02
+    dnsmos_mean_min: 3.2
+    dnsmos_sd_max: 0.2
+    dnsmos_mean_escalate_below: 3.0
+    inter_asr_wer_median_max: 0.05
+    inter_asr_wer_median_escalate: 0.10
+    duration_median_range_s: [5, 10]
+    duration_over_20s_max_fraction: 0.02
+    empty_text_max_fraction: 0.01
+
+# --------------------------------------------------------------------------
+s4_voices:                 # Plan S9
+  candidates:              # S9.2 step 2; all fit T4/L4 for zero-shot
+    - qwen3_tts_12hz_1.7b_base
+    - chatterbox_multilingual_v3
+    - voxcpm2
+    # fish_s2_pro: needs ~24 GB per S9.1 -- but an FP8 weight-only quant
+    # (drbaph/s2-pro-fp8, ~12 GB) may fit a T4. Untested.
+  reference_bank:          # S9.2 step 1
+    clip_duration_s: [6, 15]
+    dnsmos_ovrl_min: 3.3
+    utmos_min: 3.8
+    purity_top_quartile: true
+    exclude_boilerplate: true
+    exclude_laughter: true       # separate laughter bank
+    era: most_recent             # S16 Q2 default
+    per_bucket: 20
+    buckets:
+      speaking_rate: [slow, medium, fast]
+      f0_iqr: [flat, animated]
+    self_consistency_keep_top: 0.5
+  bakeoff:                 # S9.2 step 3 / S12.4
+    golden_sentences_per_host: 60
+    references_per_sentence: 3
+    min_utterances_per_condition: 100
+    bootstrap_ci: true
+  finetune:                # S9.3
+    method: lora
+    audio_hours: [1, 3]
+    epochs: [2, 5]
+    holdout_fraction: 0.05
+    keep_zero_shot_baseline: true
+  gate:                    # Gate S4-A
+    sim_o_min: 0.60
+    sim_o_min_ratio_of_real: 0.9
+    sim_o_escalate_below: 0.50
+    wer_max: 0.08
+    wer_max_ratio_of_floor: 1.5
+    wer_escalate_above: 0.15
+    utmos_min: 3.5
+    utmos_max_delta_from_real: 0.4
+    utmos_escalate_below: 3.0
+    speaking_rate_tolerance: 0.20
+    f0_iqr_min_ratio: 0.60
+    prosody_escalate_rate_delta: 0.35
+    retry_rate_max: 0.10
+    retry_rate_escalate: 0.25
+  gate_s4b:                # Gate S4-B (fine-tune)
+    must_beat_zeroshot_ttsds: true
+    wer_regression_max_absolute: 0.01
+    ood_sentences: 10
+    ood_wer_max: 0.10
+
+# --------------------------------------------------------------------------
+s5_render:                 # Plan S10
+  script_schema_version: 1
+  max_chars_per_turn: 300        # S14.9: hallucination beyond ~300-1000 chars
+  synthesis:
+    retries_max: 3               # S9.4: cap at 3 then fall back to secondary
+    verify_with_asr: true
+  mixer:
+    pause_model: learned         # S10.1 defaults
+    default_pause_ms: 300
+    overlap_simulation_max_ms: 250   # S1.2: no true overlap; simulate light
+    backchannel_source: real_clips   # S14.11: real backchannels are your friend
+  laughter:
+    source: host_laughter_bank   # Plan A for laughter (S10.1)
+  target_lufs: -16.0             # S11 loudness row
+  provenance:                    # S15 ethics hard constraints (kept from the
+                                 # dropped S6; enforced at render/output time)
+    require_id3_disclaimer: true
+    require_watermark_where_supported: true

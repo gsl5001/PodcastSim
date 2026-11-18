@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.DS_Store
+# Drive-backed; never committed (plan S3)
+data/
+models/
+out/
+# fixtures/ IS committed, but not its audio
+fixtures/**/*.flac
+fixtures/**/*.mp3
+fixtures/**/*.wav
+.coverage
+htmlcov/
+data/cache/
+
+# Local-only: episode downloader + the mp3 folder (never committed)
+downloads/
+
+# Secrets / credentials — never commit
+*.env
+.env
+rclone.conf
+hf_token
+kaggle.json
+access_token
+*.pem
+*.key
+credentials*.json
+secrets/

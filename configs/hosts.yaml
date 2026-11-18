@@ -1,0 +1,23 @@
+# The recurring hosts (plan S1.3, revised: the project now targets TWO hosts).
+#
+# NOTE: hosts are found by UNSUPERVISED CLUSTERING (S2), not hand-picked
+# enrollment clips: S2 embeds every diarized speaker and clusters them across all
+# episodes, then the top recurring clusters by speech are the hosts. The count is
+# set by the assumption below (2) and by `podcastsim identify --hosts N`.
+#
+# We keep the TWO highest-speech hosts that persist across the archive (host_0,
+# host_1). A third recurring speaker exists in the data but is excluded under the
+# two-host assumption (it has the least speech and left before the later era).
+#
+# Labels are provisional and speech-rank based (host_0 = most speech). Real names
+# are the owner's to confirm. Per-host voice checkpoints live on Drive
+# (s4/finetune_verbatim/<host_id>/); synthesis settings are in configs/voices.yaml.
+
+hosts:
+  - host_id: host_0
+    display_name: "Host 0"
+    enrollment_clips: []
+
+  - host_id: host_1
+    display_name: "Host 1"
+    enrollment_clips: []
